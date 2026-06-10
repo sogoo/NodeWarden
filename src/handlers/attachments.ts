@@ -1,10 +1,56 @@
 import { Env, Attachment, DEFAULT_DEV_SECRET } from '../types';
+import { notifyUserVaultSync } from '../durable/notifications-hub';
 import { StorageService } from '../services/storage';
 import { jsonResponse, errorResponse } from '../utils/response';
+import { buildDirectUploadUrl, getSafeJwtSecret, parseDirectUploadPayload } from '../utils/direct-upload';
 import { generateUUID } from '../utils/uuid';
-import { createFileDownloadToken, verifyFileDownloadToken } from '../utils/jwt';
-import { cipherToResponse } from './ciphers';
+import {
+  createAttachmentUploadToken,
+  createFileDownloadToken,
+  verifyAttachmentUploadToken,
+  verifyFileDownloadToken,
+} from '../utils/jwt';
+import { applyCipherEmbeddedAttachmentMetadata, cipherToResponse } from './ciphers';
 import { LIMITS } from '../config/limits';
+import { readActingDeviceIdentifier } from '../utils/device';
+import {
+  deleteBlobObject,
+  getAttachmentObjectKey,
+  getBlobObject,
+  getBlobStorageMaxBytes,
+  putBlobObject,
+} from '../services/blob-store';
+import { auditRequestMetadata, writeAuditEvent } from '../services/audit-events';
+
+function notifyVaultSyncForRequest(
+  request: Request,
+  env: Env,
+  userId: string,
+  revisionDate: string
+): void {
+  notifyUserVaultSync(env, userId, revisionDate, readActingDeviceIdentifier(request));
+}
+
+async function writeAttachmentAudit(
+  storage: StorageService,
+  request: Request,
+  userId: string,
+  action: string,
+  metadata: Record<string, unknown>
+): Promise<void> {
+  await writeAuditEvent(storage, {
+    actorUserId: userId,
+    action,
+    category: 'data',
+    level: action.includes('delete') ? 'security' : 'info',
+    targetType: 'attachment',
+    targetId: typeof metadata.id === 'string' ? metadata.id : null,
+    metadata: {
+      ...metadata,
+      ...auditRequestMetadata(request),
+    },
+  });
+}
 
 // Format file size to human readable
 function formatSize(bytes: number): string {
@@ -14,9 +60,65 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-// Get R2 object path for attachment
-function getAttachmentPath(cipherId: string, attachmentId: string): string {
-  return `${cipherId}/${attachmentId}`;
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>
+): Promise<void> {
+  if (items.length === 0) return;
+  const limit = Math.max(1, concurrency);
+  for (let index = 0; index < items.length; index += limit) {
+    await Promise.all(items.slice(index, index + limit).map(worker));
+  }
+}
+
+async function processAttachmentUpload(
+  request: Request,
+  env: Env,
+  attachment: Attachment,
+  cipherId: string
+): Promise<Response> {
+  const storage = new StorageService(env.DB);
+  const maxFileSize = getBlobStorageMaxBytes(env, LIMITS.attachment.maxFileSizeBytes);
+  const upload = await parseDirectUploadPayload(request, {
+    expectedSize: Number(attachment.size) || 0,
+    maxFileSize,
+    tooLargeMessage: `File too large. Maximum size is ${Math.floor(maxFileSize / (1024 * 1024))}MB`,
+  });
+  if (upload instanceof Response) {
+    return upload;
+  }
+
+  const path = getAttachmentObjectKey(cipherId, attachment.id);
+  try {
+    await putBlobObject(env, path, upload.body, {
+      size: upload.size,
+      contentType: upload.contentType,
+      customMetadata: {
+        cipherId,
+        attachmentId: attachment.id,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('KV object too large')) {
+      return errorResponse(`File too large. Maximum size is ${Math.floor(maxFileSize / (1024 * 1024))}MB`, 413);
+    }
+    return errorResponse('Attachment storage is not configured', 500);
+  }
+
+  if (upload.size !== attachment.size) {
+    attachment.size = upload.size;
+    attachment.sizeName = formatSize(upload.size);
+    await storage.saveAttachment(attachment);
+  }
+
+  const revisionInfo = await storage.updateCipherRevisionDate(cipherId);
+  if (revisionInfo) {
+    notifyVaultSyncForRequest(request, env, revisionInfo.userId, revisionInfo.revisionDate);
+  }
+
+  return new Response(null, { status: 201 });
 }
 
 // POST /api/ciphers/{cipherId}/attachment/v2
@@ -71,23 +173,28 @@ export async function handleCreateAttachment(
   await storage.addAttachmentToCipher(cipherId, attachmentId);
 
   // Update cipher revision date
-  await storage.updateCipherRevisionDate(cipherId);
+  const revisionInfo = await storage.updateCipherRevisionDate(cipherId);
+  if (revisionInfo) {
+    notifyVaultSyncForRequest(request, env, revisionInfo.userId, revisionInfo.revisionDate);
+  }
 
   // Get updated cipher for response
   const updatedCipher = await storage.getCipher(cipherId);
   const attachments = await storage.getAttachmentsByCipher(cipherId);
+  const jwtSecret = getSafeJwtSecret(env);
+  if (!jwtSecret) {
+    return errorResponse('Server configuration error', 500);
+  }
+  const uploadToken = await createAttachmentUploadToken(userId, cipherId, attachmentId, jwtSecret);
 
   return jsonResponse({
     object: 'attachment-fileUpload',
     attachmentId: attachmentId,
-    url: `/api/ciphers/${cipherId}/attachment/${attachmentId}`,
-    fileUploadType: 0, // Direct upload
+    url: buildDirectUploadUrl(request, `/api/ciphers/${cipherId}/attachment/${attachmentId}`, uploadToken),
+    fileUploadType: 1,
     cipherResponse: cipherToResponse(updatedCipher!, attachments),
   });
 }
-
-// Maximum file size: 100MB
-const MAX_FILE_SIZE = LIMITS.attachment.maxFileSizeBytes;
 
 // POST /api/ciphers/{cipherId}/attachment/{attachmentId}
 // Upload attachment file content
@@ -112,54 +219,45 @@ export async function handleUploadAttachment(
     return errorResponse('Attachment not found', 404);
   }
 
-  // Check content-length header for size limit
-  const contentLength = request.headers.get('content-length');
-  if (contentLength && parseInt(contentLength) > MAX_FILE_SIZE) {
-    return errorResponse('File too large. Maximum size is 100MB', 413);
+  return processAttachmentUpload(request, env, attachment, cipherId);
+}
+
+export async function handlePublicUploadAttachment(
+  request: Request,
+  env: Env,
+  cipherId: string,
+  attachmentId: string
+): Promise<Response> {
+  const jwtSecret = getSafeJwtSecret(env);
+  if (!jwtSecret) {
+    return errorResponse('Server configuration error', 500);
   }
 
-  // Get the file from multipart form data
-  const contentType = request.headers.get('content-type') || '';
-  if (!contentType.includes('multipart/form-data')) {
-    return errorResponse('Content-Type must be multipart/form-data', 400);
+  const token = new URL(request.url).searchParams.get('token');
+  if (!token) {
+    return errorResponse('Token required', 401);
   }
 
-  const formData = await request.formData();
-  const file = formData.get('data') as File | null;
-
-  if (!file) {
-    return errorResponse('No file uploaded', 400);
+  const claims = await verifyAttachmentUploadToken(token, jwtSecret);
+  if (!claims) {
+    return errorResponse('Invalid or expired token', 401);
+  }
+  if (claims.cipherId !== cipherId || claims.attachmentId !== attachmentId) {
+    return errorResponse('Token mismatch', 401);
   }
 
-  // Check actual file size
-  if (file.size > MAX_FILE_SIZE) {
-    return errorResponse('File too large. Maximum size is 100MB', 413);
+  const storage = new StorageService(env.DB);
+  const cipher = await storage.getCipher(cipherId);
+  if (!cipher || cipher.userId !== claims.userId) {
+    return errorResponse('Cipher not found', 404);
   }
 
-  // Store file in R2
-  const path = getAttachmentPath(cipherId, attachmentId);
-  await env.ATTACHMENTS.put(path, file.stream(), {
-    httpMetadata: {
-      contentType: 'application/octet-stream',
-    },
-    customMetadata: {
-      cipherId: cipherId,
-      attachmentId: attachmentId,
-    },
-  });
-
-  // Update attachment size if different
-  const actualSize = file.size;
-  if (actualSize !== attachment.size) {
-    attachment.size = actualSize;
-    attachment.sizeName = formatSize(actualSize);
-    await storage.saveAttachment(attachment);
+  const attachment = await storage.getAttachment(attachmentId);
+  if (!attachment || attachment.cipherId !== cipherId) {
+    return errorResponse('Attachment not found', 404);
   }
 
-  // Update cipher revision date
-  await storage.updateCipherRevisionDate(cipherId);
-
-  return new Response(null, { status: 200 });
+  return processAttachmentUpload(request, env, attachment, cipherId);
 }
 
 // GET /api/ciphers/{cipherId}/attachment/{attachmentId}
@@ -184,6 +282,7 @@ export async function handleGetAttachment(
   if (!attachment || attachment.cipherId !== cipherId) {
     return errorResponse('Attachment not found', 404);
   }
+  const responseAttachment = applyCipherEmbeddedAttachmentMetadata(cipher, [attachment])[0] || attachment;
 
   // Generate short-lived download token
   const token = await createFileDownloadToken(cipherId, attachmentId, env.JWT_SECRET);
@@ -194,11 +293,69 @@ export async function handleGetAttachment(
 
   return jsonResponse({
     object: 'attachment',
-    id: attachment.id,
+    id: responseAttachment.id,
     url: downloadUrl,
+    fileName: responseAttachment.fileName,
+    key: responseAttachment.key,
+    size: String(Number(responseAttachment.size) || 0),
+    sizeName: responseAttachment.sizeName,
+  });
+}
+
+// PUT /api/ciphers/{cipherId}/attachment/{attachmentId}/metadata
+// 修正旧附件的加密元数据，供官方客户端按当前 Bitwarden 契约解密。
+export async function handleUpdateAttachmentMetadata(
+  request: Request,
+  env: Env,
+  userId: string,
+  cipherId: string,
+  attachmentId: string
+): Promise<Response> {
+  const storage = new StorageService(env.DB);
+
+  const cipher = await storage.getCipher(cipherId);
+  if (!cipher || cipher.userId !== userId) {
+    return errorResponse('Cipher not found', 404);
+  }
+
+  const attachment = await storage.getAttachment(attachmentId);
+  if (!attachment || attachment.cipherId !== cipherId) {
+    return errorResponse('Attachment not found', 404);
+  }
+
+  let body: { fileName?: string | null; key?: string | null };
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse('Invalid JSON', 400);
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(body, 'fileName') && !Object.prototype.hasOwnProperty.call(body, 'key')) {
+    return errorResponse('No metadata fields supplied', 400);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, 'fileName')) {
+    const fileName = String(body.fileName || '').trim();
+    if (!fileName) return errorResponse('fileName is required', 400);
+    attachment.fileName = fileName;
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'key')) {
+    const key = body.key == null ? null : String(body.key || '').trim();
+    attachment.key = key || null;
+  }
+
+  await storage.saveAttachment(attachment);
+  const revisionInfo = await storage.updateCipherRevisionDate(cipherId);
+  if (revisionInfo) {
+    notifyVaultSyncForRequest(request, env, revisionInfo.userId, revisionInfo.revisionDate);
+  }
+
+  return jsonResponse({
+    object: 'attachment',
+    id: attachment.id,
     fileName: attachment.fileName,
     key: attachment.key,
-    size: Number(attachment.size) || 0,
+    size: String(Number(attachment.size) || 0),
     sizeName: attachment.sizeName,
   });
 }
@@ -242,9 +399,8 @@ export async function handlePublicDownloadAttachment(
     return errorResponse('Attachment not found', 404);
   }
 
-  // Get file from R2
-  const path = getAttachmentPath(cipherId, attachmentId);
-  const object = await env.ATTACHMENTS.get(path);
+  const path = getAttachmentObjectKey(cipherId, attachmentId);
+  const object = await getBlobObject(env, path);
 
   if (!object) {
     return errorResponse('Attachment file not found', 404);
@@ -257,7 +413,7 @@ export async function handlePublicDownloadAttachment(
 
   return new Response(object.body, {
     headers: {
-      'Content-Type': 'application/octet-stream',
+      'Content-Type': object.contentType || 'application/octet-stream',
       'Content-Length': String(object.size),
       'Cache-Control': 'private, no-cache',
     },
@@ -287,18 +443,22 @@ export async function handleDeleteAttachment(
     return errorResponse('Attachment not found', 404);
   }
 
-  // Delete file from R2
-  const path = getAttachmentPath(cipherId, attachmentId);
-  await env.ATTACHMENTS.delete(path);
+  const path = getAttachmentObjectKey(cipherId, attachmentId);
+  await deleteBlobObject(env, path);
 
   // Delete attachment metadata
   await storage.deleteAttachment(attachmentId);
 
-  // Remove attachment from cipher
-  await storage.removeAttachmentFromCipher(cipherId, attachmentId);
-
   // Update cipher revision date
-  await storage.updateCipherRevisionDate(cipherId);
+  const revisionInfo = await storage.updateCipherRevisionDate(cipherId);
+  if (revisionInfo) {
+    notifyVaultSyncForRequest(request, env, revisionInfo.userId, revisionInfo.revisionDate);
+    await writeAttachmentAudit(storage, request, revisionInfo.userId, 'attachment.delete', {
+      id: attachmentId,
+      cipherId,
+      size: attachment.size,
+    });
+  }
 
   // Get updated cipher for response
   const updatedCipher = await storage.getCipher(cipherId);
@@ -314,12 +474,24 @@ export async function deleteAllAttachmentsForCipher(
   env: Env,
   cipherId: string
 ): Promise<void> {
-  const storage = new StorageService(env.DB);
-  const attachments = await storage.getAttachmentsByCipher(cipherId);
+  await deleteAllAttachmentsForCiphers(env, [cipherId]);
+}
 
-  for (const attachment of attachments) {
-    const path = getAttachmentPath(cipherId, attachment.id);
-    await env.ATTACHMENTS.delete(path);
-    await storage.deleteAttachment(attachment.id);
-  }
+export async function deleteAllAttachmentsForCiphers(
+  env: Env,
+  cipherIds: string[]
+): Promise<void> {
+  const storage = new StorageService(env.DB);
+  const attachmentsByCipher = await storage.getAttachmentsByCipherIds(cipherIds);
+  const attachments = Array.from(attachmentsByCipher.entries()).flatMap(([ownedCipherId, items]) =>
+    items.map((attachment) => ({ attachment, cipherId: ownedCipherId }))
+  );
+  if (!attachments.length) return;
+
+  await runWithConcurrency(attachments, LIMITS.performance.attachmentDeleteConcurrency, async ({ attachment, cipherId }) => {
+    const path = getAttachmentObjectKey(cipherId, attachment.id);
+    await deleteBlobObject(env, path);
+  });
+
+  await storage.bulkDeleteAttachmentsByIds(attachments.map(({ attachment }) => attachment.id));
 }

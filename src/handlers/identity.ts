@@ -7,27 +7,158 @@ import { LIMITS } from '../config/limits';
 import { isTotpEnabled, verifyTotpToken } from '../utils/totp';
 import { createRefreshToken } from '../utils/jwt';
 import { readAuthRequestDeviceInfo } from '../utils/device';
+import { createRecoveryCode, recoveryCodeEquals } from '../utils/recovery-code';
+import { generateUUID } from '../utils/uuid';
+import { issueSendAccessToken } from './sends';
+import {
+  buildAccountKeys,
+  buildUserDecryptionOptions,
+} from '../utils/user-decryption';
+import { auditRequestMetadata, safeWriteAuditEvent } from '../services/audit-events';
+import {
+  assertAccountPasskeyCredential,
+  buildAccountPasskeyTokenUserDecryptionOption,
+} from './account-passkeys';
 
 const TWO_FACTOR_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const TWO_FACTOR_PROVIDER_AUTHENTICATOR = 0;
 const TWO_FACTOR_PROVIDER_REMEMBER = 5;
+const WEB_REFRESH_COOKIE = 'nodewarden_web_refresh';
+// Android client (2026.2.x) deserializes TwoFactorProviders2 keys with -1 for recovery code.
+// Keep request parsing backward-compatible with historical provider values (8 / 100).
+const TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE = '-1';
+const TWO_FACTOR_PROVIDER_RECOVERY_CODE_LEGACY = 8;
+const TWO_FACTOR_PROVIDER_RECOVERY_CODE_ANDROID_REQUEST = 100;
 
-function twoFactorRequiredResponse(message: string = 'Two factor required.'): Response {
+function resolveTotpSecret(userSecret: string | null): string | null {
+  if (userSecret && isTotpEnabled(userSecret)) {
+    return userSecret;
+  }
+  return null;
+}
+
+async function resolveDeviceSession(
+  storage: StorageService,
+  userId: string,
+  deviceInfo: ReturnType<typeof readAuthRequestDeviceInfo>
+): Promise<{ identifier: string; sessionStamp: string } | null> {
+  if (!deviceInfo.deviceIdentifier) return null;
+  const existingDevice = await storage.getDevice(userId, deviceInfo.deviceIdentifier);
+  const sessionStamp = String(existingDevice?.sessionStamp || '').trim() || generateUUID();
+  return { identifier: deviceInfo.deviceIdentifier, sessionStamp };
+}
+
+function shouldUseWebSession(request: Request): boolean {
+  return String(request.headers.get('X-NodeWarden-Web-Session') || '').trim() === '1';
+}
+
+function parseCookieValue(request: Request, name: string): string | null {
+  const rawCookie = String(request.headers.get('Cookie') || '').trim();
+  if (!rawCookie) return null;
+  for (const part of rawCookie.split(';')) {
+    const [key, ...rest] = part.trim().split('=');
+    if (key !== name) continue;
+    const value = rest.join('=').trim();
+    return value ? decodeURIComponent(value) : null;
+  }
+  return null;
+}
+
+function constantTimeEquals(a: string, b: string): boolean {
+  const encA = new TextEncoder().encode(a);
+  const encB = new TextEncoder().encode(b);
+  if (encA.length !== encB.length) return false;
+
+  let diff = 0;
+  for (let i = 0; i < encA.length; i++) {
+    diff |= encA[i] ^ encB[i];
+  }
+  return diff === 0;
+}
+
+function buildRefreshCookie(request: Request, refreshToken: string, maxAgeSeconds: number): string {
+  const isHttps = new URL(request.url).protocol === 'https:';
+  const parts = [
+    `${WEB_REFRESH_COOKIE}=${encodeURIComponent(refreshToken)}`,
+    'Path=/identity/connect',
+    'HttpOnly',
+    'SameSite=Strict',
+    `Max-Age=${Math.max(0, Math.floor(maxAgeSeconds))}`,
+  ];
+  if (isHttps) parts.push('Secure');
+  return parts.join('; ');
+}
+
+function buildClearedRefreshCookie(request: Request): string {
+  return buildRefreshCookie(request, '', 0);
+}
+
+function withWebRefreshCookie(request: Request, response: Response, refreshToken: string | null): Response {
+  const headers = new Headers(response.headers);
+  headers.append(
+    'Set-Cookie',
+    refreshToken
+      ? buildRefreshCookie(request, refreshToken, Math.floor(LIMITS.auth.refreshTokenTtlMs / 1000))
+      : buildClearedRefreshCookie(request)
+  );
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function buildPreloginResponse(
+  email: string,
+  kdfType: number,
+  kdfIterations: number,
+  kdfMemory: number | null,
+  kdfParallelism: number | null
+): Record<string, unknown> {
+  return {
+    kdf: kdfType,
+    kdfIterations,
+    kdfMemory,
+    kdfParallelism,
+    KdfSettings: {
+      KdfType: kdfType,
+      Iterations: kdfIterations,
+      Memory: kdfMemory,
+      Parallelism: kdfParallelism,
+    },
+    Salt: email.toLowerCase(),
+  };
+}
+
+function twoFactorRequiredResponse(message: string = 'Two factor required.', includeRecoveryCode: boolean = false): Response {
+  const providers = includeRecoveryCode
+    ? [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR), TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE]
+    : [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)];
+  const providers2: Record<string, null> = {};
+  for (const provider of providers) providers2[provider] = null;
+  const customResponse = {
+    TwoFactorProviders: providers,
+    TwoFactorProviders2: providers2,
+    SsoEmail2faSessionToken: null,
+    MasterPasswordPolicy: {
+      Object: 'masterPasswordPolicy',
+    },
+  };
+
   // Bitwarden clients rely on these fields to trigger the 2FA UI flow.
   return jsonResponse(
     {
       error: 'invalid_grant',
       error_description: message,
-      TwoFactorProviders: [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)],
-      TwoFactorProviders2: {
-        [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)]: null,
-      },
+      Error: 'invalid_grant',
+      ErrorDescription: message,
+      ErrorMessage: message,
+      TwoFactorProviders: customResponse.TwoFactorProviders,
+      TwoFactorProviders2: customResponse.TwoFactorProviders2,
       // Required by current Android parser (nullable value is acceptable).
-      SsoEmail2faSessionToken: null,
-      // Keep payload shape close to upstream implementations.
-      MasterPasswordPolicy: {
-        Object: 'masterPasswordPolicy',
-      },
+      SsoEmail2faSessionToken: customResponse.SsoEmail2faSessionToken,
+      MasterPasswordPolicy: customResponse.MasterPasswordPolicy,
+      CustomResponse: customResponse,
       ErrorModel: {
         Message: message,
         Object: 'error',
@@ -88,6 +219,10 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
   }
 
   const grantType = body.grant_type;
+  const clientIdentifier = getClientIdentifier(request);
+  if (!clientIdentifier) {
+    return identityErrorResponse('Client IP is required', 'invalid_request', 403);
+  }
 
   if (grantType === 'password') {
     // Login with password
@@ -96,7 +231,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
     const twoFactorToken = body.twoFactorToken;
     const twoFactorProvider = body.twoFactorProvider;
     const twoFactorRemember = body.twoFactorRemember;
-    const loginIdentifier = getClientIdentifier(request);
+    const loginIdentifier = clientIdentifier;
     const deviceInfo = readAuthRequestDeviceInfo(body, request);
 
     if (!email || !passwordHash) {
@@ -119,9 +254,39 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       await rateLimit.recordFailedLogin(loginIdentifier);
       return identityErrorResponse('Username or password is incorrect. Try again', 'invalid_grant', 400);
     }
+    if (user.status !== 'active') {
+      await rateLimit.recordFailedLogin(loginIdentifier);
+      await safeWriteAuditEvent(env, {
+        actorUserId: user.id,
+        action: 'auth.login.failed.user_inactive',
+        category: 'auth',
+        level: 'warn',
+        targetType: 'user',
+        targetId: user.id,
+        metadata: {
+          grantType,
+          deviceIdentifier: deviceInfo.deviceIdentifier,
+          ...auditRequestMetadata(request),
+        },
+      });
+      return identityErrorResponse('Account is disabled', 'invalid_grant', 400);
+    }
 
-    const valid = await auth.verifyPassword(passwordHash, user.masterPasswordHash);
+    const valid = await auth.verifyPassword(passwordHash, user.masterPasswordHash, user.email);
     if (!valid) {
+      await safeWriteAuditEvent(env, {
+        actorUserId: user.id,
+        action: 'auth.login.failed.bad_password',
+        category: 'auth',
+        level: 'warn',
+        targetType: 'user',
+        targetId: user.id,
+        metadata: {
+          grantType,
+          deviceIdentifier: deviceInfo.deviceIdentifier,
+          ...auditRequestMetadata(request),
+        },
+      });
       return recordFailedLoginAndBuildResponse(
         rateLimit,
         loginIdentifier,
@@ -129,28 +294,25 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       );
     }
 
-    // Optional 2FA: enabled only when TOTP_SECRET is configured in Workers env.
+    // Optional 2FA: enabled only by per-user secret.
     let trustedTwoFactorTokenToReturn: string | undefined;
-    if (isTotpEnabled(env.TOTP_SECRET)) {
+    const effectiveTotpSecret = resolveTotpSecret(user.totpSecret);
+    if (effectiveTotpSecret) {
+      const canUseRecoveryCode = !!user.totpRecoveryCode;
       const normalizedTwoFactorProvider = String(twoFactorProvider ?? '').trim();
       const normalizedTwoFactorToken = String(twoFactorToken ?? '').trim();
-      const rememberRequested = ['1', 'true', 'True', 'TRUE', 'on', 'yes', 'Yes', 'YES'].includes(String(twoFactorRemember || '').trim());
+      let rememberRequested = ['1', 'true', 'True', 'TRUE', 'on', 'yes', 'Yes', 'YES'].includes(String(twoFactorRemember || '').trim());
       const hasProvider = normalizedTwoFactorProvider.length > 0;
       const hasToken = normalizedTwoFactorToken.length > 0;
 
       // Upstream-compatible behavior: if 2FA is required and either provider or token is missing,
       // respond with a 2FA challenge payload.
       if (!hasProvider || !hasToken) {
-        return twoFactorRequiredResponse();
-      }
-
-      const parsedProvider = Number.parseInt(normalizedTwoFactorProvider, 10);
-      if (!Number.isFinite(parsedProvider)) {
-        return twoFactorRequiredResponse();
+        return twoFactorRequiredResponse('Two factor required.', canUseRecoveryCode);
       }
 
       let passedByRememberToken = false;
-      if (parsedProvider === TWO_FACTOR_PROVIDER_REMEMBER) {
+      if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_REMEMBER)) {
         if (deviceInfo.deviceIdentifier) {
           const trustedUserId = await storage.getTrustedTwoFactorDeviceTokenUserId(
             normalizedTwoFactorToken,
@@ -161,13 +323,27 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
 
         // Remember token missing/invalid/expired should re-enter the 2FA challenge flow.
         if (!passedByRememberToken) {
-          return twoFactorRequiredResponse();
+          return twoFactorRequiredResponse('Two factor required.', canUseRecoveryCode);
         }
-      } else if (parsedProvider === TWO_FACTOR_PROVIDER_AUTHENTICATOR) {
-        const totpOk = await verifyTotpToken(env.TOTP_SECRET!, normalizedTwoFactorToken);
+      } else if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)) {
+        const totpOk = await verifyTotpToken(effectiveTotpSecret, normalizedTwoFactorToken);
         if (!totpOk) {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
+      } else if (
+        normalizedTwoFactorProvider === TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE ||
+        normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_RECOVERY_CODE_LEGACY) ||
+        normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_RECOVERY_CODE_ANDROID_REQUEST)
+      ) {
+        if (!recoveryCodeEquals(normalizedTwoFactorToken, user.totpRecoveryCode)) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+        user.totpSecret = null;
+        user.totpRecoveryCode = createRecoveryCode();
+        user.updatedAt = new Date().toISOString();
+        await storage.saveUser(user);
+        await storage.deleteRefreshTokensByUserId(user.id);
+        rememberRequested = false;
       } else {
         // Unsupported provider for this server profile behaves as an invalid 2FA attempt.
         return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
@@ -186,104 +362,460 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
     }
 
     // Persist device only after successful password + (optional) 2FA verification.
-    if (deviceInfo.deviceIdentifier) {
-      await storage.upsertDevice(user.id, deviceInfo.deviceIdentifier, deviceInfo.deviceName, deviceInfo.deviceType);
+    const deviceSession = await resolveDeviceSession(storage, user.id, deviceInfo);
+    if (deviceSession) {
+      await storage.upsertDevice(
+        user.id,
+        deviceSession.identifier,
+        deviceInfo.deviceName,
+        deviceInfo.deviceType,
+        deviceSession.sessionStamp
+      );
     }
 
     // Successful login - clear failed attempts
     await rateLimit.clearLoginAttempts(loginIdentifier);
 
-    const accessToken = await auth.generateAccessToken(user);
-    const refreshToken = await auth.generateRefreshToken(user.id);
+    const accessToken = await auth.generateAccessToken(user, deviceSession);
+    const refreshToken = await auth.generateRefreshToken(user.id, deviceSession);
+    const accountKeys = buildAccountKeys(user);
+    const userDecryptionOptions = buildUserDecryptionOptions(user);
+    await safeWriteAuditEvent(env, {
+      actorUserId: user.id,
+      action: 'auth.login.success',
+      category: 'auth',
+      level: 'info',
+      targetType: 'user',
+      targetId: user.id,
+      metadata: {
+        grantType,
+        webSession: shouldUseWebSession(request),
+        deviceIdentifier: deviceSession?.identifier ?? deviceInfo.deviceIdentifier,
+        deviceType: deviceInfo.deviceType,
+        ...auditRequestMetadata(request),
+      },
+    });
 
     const response: TokenResponse = {
       access_token: accessToken,
       expires_in: LIMITS.auth.accessTokenTtlSeconds,
       token_type: 'Bearer',
-      refresh_token: refreshToken,
+      ...(shouldUseWebSession(request) ? { web_session: true } : { refresh_token: refreshToken }),
       ...(trustedTwoFactorTokenToReturn ? { TwoFactorToken: trustedTwoFactorTokenToReturn } : {}),
       Key: user.key,
       PrivateKey: user.privateKey,
+      AccountKeys: accountKeys,
+      accountKeys: accountKeys,
       Kdf: user.kdfType,
       KdfIterations: user.kdfIterations,
       KdfMemory: user.kdfMemory,
       KdfParallelism: user.kdfParallelism,
       ForcePasswordReset: false,
       ResetMasterPassword: false,
+      MasterPasswordPolicy: {
+        Object: 'masterPasswordPolicy',
+      },
+      ApiUseKeyConnector: false,
       scope: 'api offline_access',
       unofficialServer: true,
-      UserDecryptionOptions: {
-        HasMasterPassword: true,
-        Object: 'userDecryptionOptions',
-        MasterPasswordUnlock: {
-          Kdf: {
-            KdfType: user.kdfType,
-            Iterations: user.kdfIterations,
-            Memory: user.kdfMemory || null,
-            Parallelism: user.kdfParallelism || null,
-          },
-          MasterKeyEncryptedUserKey: user.key,
-          MasterKeyWrappedUserKey: user.key,
-          Salt: email, // email is already lowercased above
-          Object: 'masterPasswordUnlock',
-        },
-      },
+      UserDecryptionOptions: userDecryptionOptions,
+      userDecryptionOptions: userDecryptionOptions,
     };
 
-    return jsonResponse(response);
+    const baseResponse = jsonResponse(response);
+    return shouldUseWebSession(request)
+      ? withWebRefreshCookie(request, baseResponse, refreshToken)
+      : baseResponse;
 
+  } else if (grantType === 'webauthn') {
+    const loginIdentifier = clientIdentifier;
+    const loginCheck = await rateLimit.checkLoginAttempt(loginIdentifier);
+    if (!loginCheck.allowed) {
+      return identityErrorResponse(
+        `Too many failed login attempts. Try again in ${Math.ceil(loginCheck.retryAfterSeconds! / 60)} minutes.`,
+        'TooManyRequests',
+        429
+      );
+    }
+
+    const token = String(body.token || '').trim();
+    let deviceResponse: unknown = body.deviceResponse;
+    if (typeof deviceResponse === 'string') {
+      try {
+        deviceResponse = JSON.parse(deviceResponse);
+      } catch {
+        return identityErrorResponse('Invalid passkey response', 'invalid_request', 400);
+      }
+    }
+    if (!token || !deviceResponse) {
+      return identityErrorResponse('Passkey token and deviceResponse are required', 'invalid_request', 400);
+    }
+
+    let asserted: Awaited<ReturnType<typeof assertAccountPasskeyCredential>>;
+    try {
+      asserted = await assertAccountPasskeyCredential(request, env, storage, {
+        token,
+        deviceResponse,
+        scope: 'Authentication',
+      });
+    } catch (error) {
+      await rateLimit.recordFailedLogin(loginIdentifier);
+      await safeWriteAuditEvent(env, {
+        actorUserId: null,
+        action: 'auth.passkey.login.failed',
+        category: 'auth',
+        level: 'warn',
+        targetType: 'accountPasskey',
+        targetId: null,
+        metadata: {
+          grantType,
+          reason: error instanceof Error ? error.message : 'assertion_failed',
+          ...auditRequestMetadata(request),
+        },
+      });
+      return identityErrorResponse('Passkey is invalid. Try again', 'invalid_grant', 400);
+    }
+
+    const { user, credential } = asserted;
+    if (user.status !== 'active') {
+      await rateLimit.recordFailedLogin(loginIdentifier);
+      return identityErrorResponse('Account is disabled', 'invalid_grant', 400);
+    }
+
+    const deviceInfo = readAuthRequestDeviceInfo(body, request);
+    const deviceSession = await resolveDeviceSession(storage, user.id, deviceInfo);
+    if (deviceSession) {
+      await storage.upsertDevice(
+        user.id,
+        deviceSession.identifier,
+        deviceInfo.deviceName,
+        deviceInfo.deviceType,
+        deviceSession.sessionStamp
+      );
+    }
+
+    await rateLimit.clearLoginAttempts(loginIdentifier);
+
+    const accessToken = await auth.generateAccessToken(user, deviceSession);
+    const refreshToken = await auth.generateRefreshToken(user.id, deviceSession);
+    const accountKeys = buildAccountKeys(user);
+    const webAuthnPrfOption = buildAccountPasskeyTokenUserDecryptionOption(credential);
+    const userDecryptionOptions = buildUserDecryptionOptions(user, webAuthnPrfOption);
+    await safeWriteAuditEvent(env, {
+      actorUserId: user.id,
+      action: 'auth.passkey.login.success',
+      category: 'auth',
+      level: 'info',
+      targetType: 'accountPasskey',
+      targetId: credential.id,
+      metadata: {
+        grantType,
+        webSession: shouldUseWebSession(request),
+        deviceIdentifier: deviceSession?.identifier ?? deviceInfo.deviceIdentifier,
+        deviceType: deviceInfo.deviceType,
+        ...auditRequestMetadata(request),
+      },
+    });
+
+    const response: TokenResponse = {
+      access_token: accessToken,
+      expires_in: LIMITS.auth.accessTokenTtlSeconds,
+      token_type: 'Bearer',
+      ...(shouldUseWebSession(request) ? { web_session: true } : { refresh_token: refreshToken }),
+      Key: user.key,
+      PrivateKey: user.privateKey,
+      AccountKeys: accountKeys,
+      accountKeys: accountKeys,
+      Kdf: user.kdfType,
+      KdfIterations: user.kdfIterations,
+      KdfMemory: user.kdfMemory,
+      KdfParallelism: user.kdfParallelism,
+      ForcePasswordReset: false,
+      ResetMasterPassword: false,
+      MasterPasswordPolicy: {
+        Object: 'masterPasswordPolicy',
+      },
+      ApiUseKeyConnector: false,
+      scope: 'api offline_access',
+      unofficialServer: true,
+      UserDecryptionOptions: userDecryptionOptions,
+      userDecryptionOptions: userDecryptionOptions,
+    };
+
+    const baseResponse = jsonResponse(response);
+    return shouldUseWebSession(request)
+      ? withWebRefreshCookie(request, baseResponse, refreshToken)
+      : baseResponse;
+
+  } else if (grantType === 'client_credentials') {
+    // Login with client credentials
+    const clientId = body.client_id;
+    const clientSecret = body.client_secret;
+    const scope = body.scope;
+    const deviceInfo = readAuthRequestDeviceInfo(body, request);
+
+    const loginIdentifier = clientIdentifier;
+    const parmValid = checkClientCredentialsParam(clientId, clientSecret, scope);
+    if (!parmValid) {
+      return identityErrorResponse('Parameter error', 'invalid_request', 400);
+    }
+
+    // Check login lockout before user lookup to reduce user-enumeration signal
+    const loginCheck = await rateLimit.checkLoginAttempt(loginIdentifier);
+    if (!loginCheck.allowed) {
+      return identityErrorResponse(
+        `Too many failed login attempts. Try again in ${Math.ceil(loginCheck.retryAfterSeconds! / 60)} minutes.`,
+        'TooManyRequests',
+        429
+      );
+    }
+
+    const uid = clientId.slice(5);
+    const user = await storage.getUserById(uid);
+    if (!user) {
+      await rateLimit.recordFailedLogin(loginIdentifier);
+      return identityErrorResponse('ClientId or clientSecret is incorrect. Try again', 'invalid_grant', 400);
+    }
+    if (user.status !== 'active') {
+      await rateLimit.recordFailedLogin(loginIdentifier);
+      await safeWriteAuditEvent(env, {
+        actorUserId: user.id,
+        action: 'auth.login.failed.user_inactive',
+        category: 'auth',
+        level: 'warn',
+        targetType: 'user',
+        targetId: user.id,
+        metadata: {
+          grantType,
+          deviceIdentifier: deviceInfo.deviceIdentifier,
+          ...auditRequestMetadata(request),
+        },
+      });
+      return identityErrorResponse('Account is disabled', 'invalid_grant', 400);
+    }
+
+    if (!user.apiKey || !constantTimeEquals(clientSecret, user.apiKey)) {
+      await rateLimit.recordFailedLogin(loginIdentifier);
+      await safeWriteAuditEvent(env, {
+        actorUserId: user.id,
+        action: 'auth.login.failed.bad_api_key',
+        category: 'auth',
+        level: 'warn',
+        targetType: 'user',
+        targetId: user.id,
+        metadata: {
+          grantType,
+          deviceIdentifier: deviceInfo.deviceIdentifier,
+          ...auditRequestMetadata(request),
+        },
+      });
+      return identityErrorResponse('ClientId or clientSecret is incorrect. Try again', 'invalid_grant', 400);
+    }
+
+    // Persist device only after successful client credential verification.
+    const deviceSession = await resolveDeviceSession(storage, user.id, deviceInfo);
+    if (deviceSession) {
+      await storage.upsertDevice(
+        user.id,
+        deviceSession.identifier,
+        deviceInfo.deviceName,
+        deviceInfo.deviceType,
+        deviceSession.sessionStamp
+      );
+    }
+
+    // Successful login - clear failed attempts
+    await rateLimit.clearLoginAttempts(loginIdentifier);
+
+    const accessToken = await auth.generateAccessToken(user, deviceSession);
+    const refreshToken = await auth.generateRefreshToken(user.id, deviceSession);
+    const accountKeys = buildAccountKeys(user);
+    const userDecryptionOptions = buildUserDecryptionOptions(user);
+    await safeWriteAuditEvent(env, {
+      actorUserId: user.id,
+      action: 'auth.login.success',
+      category: 'auth',
+      level: 'info',
+      targetType: 'user',
+      targetId: user.id,
+      metadata: {
+        grantType,
+        webSession: shouldUseWebSession(request),
+        deviceIdentifier: deviceSession?.identifier ?? deviceInfo.deviceIdentifier,
+        deviceType: deviceInfo.deviceType,
+        ...auditRequestMetadata(request),
+      },
+    });
+
+    const response: TokenResponse = {
+      access_token: accessToken,
+      expires_in: LIMITS.auth.accessTokenTtlSeconds,
+      token_type: 'Bearer',
+      ...(shouldUseWebSession(request) ? { web_session: true } : { refresh_token: refreshToken }),
+      Key: user.key,
+      PrivateKey: user.privateKey,
+      AccountKeys: accountKeys,
+      accountKeys: accountKeys,
+      Kdf: user.kdfType,
+      KdfIterations: user.kdfIterations,
+      KdfMemory: user.kdfMemory,
+      KdfParallelism: user.kdfParallelism,
+      ForcePasswordReset: false,
+      ResetMasterPassword: false,
+      MasterPasswordPolicy: {
+        Object: 'masterPasswordPolicy',
+      },
+      ApiUseKeyConnector: false,
+      scope: 'api offline_access',
+      unofficialServer: true,
+      UserDecryptionOptions: userDecryptionOptions,
+      userDecryptionOptions: userDecryptionOptions,
+    };
+
+    const baseResponse = jsonResponse(response);
+    return shouldUseWebSession(request)
+      ? withWebRefreshCookie(request, baseResponse, refreshToken)
+      : baseResponse;
+
+  } else if (grantType === 'send_access') {
+    const sendAccessLimit = await rateLimit.consumeBudget(`${clientIdentifier}:public`, LIMITS.rateLimit.publicRequestsPerMinute);
+    if (!sendAccessLimit.allowed) {
+      return identityErrorResponse(
+        `Rate limit exceeded. Try again in ${sendAccessLimit.retryAfterSeconds} seconds.`,
+        'TooManyRequests',
+        429
+      );
+    }
+
+    const sendId = String(body.send_id || body.sendId || '').trim();
+    if (!sendId) {
+      return jsonResponse(
+        {
+          error: 'invalid_request',
+          error_description: 'send_id is required',
+          send_access_error_type: 'invalid_send_id',
+          ErrorModel: {
+            Message: 'send_id is required',
+            Object: 'error',
+          },
+        },
+        400
+      );
+    }
+
+    const passwordHashB64 = String(
+      body.password_hash_b64 || body.passwordHashB64 || body.passwordHash || body.password_hash || ''
+    ).trim() || null;
+    const password = String(body.password || '').trim() || null;
+
+    const result = await issueSendAccessToken(
+      env,
+      sendId,
+      passwordHashB64,
+      password,
+      rateLimit,
+      `${clientIdentifier}:send-password`
+    );
+    if ('error' in result) {
+      return result.error;
+    }
+
+    return jsonResponse({
+      access_token: result.token,
+      expires_in: LIMITS.auth.sendAccessTokenTtlSeconds,
+      token_type: 'Bearer',
+      scope: 'api.send',
+      unofficialServer: true,
+    });
   } else if (grantType === 'refresh_token') {
+    const refreshLimit = await rateLimit.consumeBudget(
+      `${clientIdentifier}:identity-refresh`,
+      LIMITS.rateLimit.refreshTokenRequestsPerMinute
+    );
+    if (!refreshLimit.allowed) {
+      return identityErrorResponse(
+        `Rate limit exceeded. Try again in ${refreshLimit.retryAfterSeconds} seconds.`,
+        'TooManyRequests',
+        429
+      );
+    }
+
     // Refresh token
-    const refreshToken = body.refresh_token;
+    const refreshToken = String(body.refresh_token || '').trim() || (
+      shouldUseWebSession(request)
+        ? parseCookieValue(request, WEB_REFRESH_COOKIE)
+        : null
+    );
     if (!refreshToken) {
       return identityErrorResponse('Refresh token is required', 'invalid_request', 400);
     }
 
-    const result = await auth.refreshAccessToken(refreshToken);
-    if (!result) {
-      return identityErrorResponse('Invalid refresh token', 'invalid_grant', 400);
+    const result = await auth.refreshAccessTokenDetailed(refreshToken);
+    if (!result.ok) {
+      await safeWriteAuditEvent(env, {
+        actorUserId: result.userId ?? null,
+        action: `auth.refresh.failed.${result.reason}`,
+        category: 'auth',
+        level: 'warn',
+        targetType: result.deviceIdentifier ? 'device' : 'refreshToken',
+        targetId: result.deviceIdentifier ?? null,
+        metadata: {
+          grantType,
+          reason: result.reason,
+          webSession: shouldUseWebSession(request),
+          ...auditRequestMetadata(request),
+        },
+      });
+      const invalidResponse = identityErrorResponse('Invalid refresh token', 'invalid_grant', 400);
+      return shouldUseWebSession(request)
+        ? withWebRefreshCookie(request, invalidResponse, null)
+        : invalidResponse;
     }
 
-    // Revoke old refresh token (prevent reuse)
-    await storage.deleteRefreshToken(refreshToken);
+    // Keep a short overlap window for old refresh token to absorb
+    // concurrent refresh requests from multiple client contexts.
+    await storage.constrainRefreshTokenExpiry(
+      refreshToken,
+      Date.now() + LIMITS.auth.refreshTokenOverlapGraceMs
+    );
 
-    const { accessToken, user } = result;
-    const newRefreshToken = await auth.generateRefreshToken(user.id);
+    const { accessToken, user, device } = result;
+    if (device?.identifier) {
+      await storage.touchDeviceLastSeen(user.id, device.identifier);
+    }
+    const newRefreshToken = await auth.generateRefreshToken(user.id, device);
+    const accountKeys = buildAccountKeys(user);
+    const userDecryptionOptions = buildUserDecryptionOptions(user);
 
     const response: TokenResponse = {
       access_token: accessToken,
       expires_in: LIMITS.auth.accessTokenTtlSeconds,
       token_type: 'Bearer',
-      refresh_token: newRefreshToken,
+      ...(shouldUseWebSession(request) ? { web_session: true } : { refresh_token: newRefreshToken }),
       Key: user.key,
       PrivateKey: user.privateKey,
+      AccountKeys: accountKeys,
+      accountKeys: accountKeys,
       Kdf: user.kdfType,
       KdfIterations: user.kdfIterations,
       KdfMemory: user.kdfMemory,
       KdfParallelism: user.kdfParallelism,
       ForcePasswordReset: false,
       ResetMasterPassword: false,
+      MasterPasswordPolicy: {
+        Object: 'masterPasswordPolicy',
+      },
+      ApiUseKeyConnector: false,
       scope: 'api offline_access',
       unofficialServer: true,
-      UserDecryptionOptions: {
-        HasMasterPassword: true,
-        Object: 'userDecryptionOptions',
-        MasterPasswordUnlock: {
-          Kdf: {
-            KdfType: user.kdfType,
-            Iterations: user.kdfIterations,
-            Memory: user.kdfMemory || null,
-            Parallelism: user.kdfParallelism || null,
-          },
-          MasterKeyEncryptedUserKey: user.key,
-          MasterKeyWrappedUserKey: user.key,
-          Salt: user.email.toLowerCase(),
-          Object: 'masterPasswordUnlock',
-        },
-      },
+      UserDecryptionOptions: userDecryptionOptions,
+      userDecryptionOptions: userDecryptionOptions,
     };
 
-    return jsonResponse(response);
+    const baseResponse = jsonResponse(response);
+    return shouldUseWebSession(request)
+      ? withWebRefreshCookie(request, baseResponse, newRefreshToken)
+      : baseResponse;
   }
 
   return identityErrorResponse('Unsupported grant type', 'unsupported_grant_type', 400);
@@ -310,15 +842,12 @@ export async function handlePrelogin(request: Request, env: Env): Promise<Respon
   // Return default KDF settings even if user doesn't exist (to prevent user enumeration)
   const kdfType = user?.kdfType ?? 0;
   const kdfIterations = user?.kdfIterations ?? LIMITS.auth.defaultKdfIterations;
-  const kdfMemory = user?.kdfMemory;
-  const kdfParallelism = user?.kdfParallelism;
+  // Use ?? null so non-existent users return null (not undefined/omitted) for these fields,
+  // matching the response shape of real PBKDF2 users and reducing enumeration signal.
+  const kdfMemory = user?.kdfMemory ?? null;
+  const kdfParallelism = user?.kdfParallelism ?? null;
 
-  return jsonResponse({
-    kdf: kdfType,
-    kdfIterations: kdfIterations,
-    kdfMemory: kdfMemory,
-    kdfParallelism: kdfParallelism,
-  });
+  return jsonResponse(buildPreloginResponse(email, kdfType, kdfIterations, kdfMemory, kdfParallelism));
 }
 
 // POST /identity/connect/revocation
@@ -340,10 +869,30 @@ export async function handleRevocation(request: Request, env: Env): Promise<Resp
     return new Response(null, { status: 200 });
   }
 
-  const token = String(body.token || '').trim();
+  const token = String(body.token || '').trim() || (
+    shouldUseWebSession(request)
+      ? (parseCookieValue(request, WEB_REFRESH_COOKIE) || '')
+      : ''
+  );
   if (token) {
     await storage.deleteRefreshToken(token);
   }
 
-  return new Response(null, { status: 200 });
+  const baseResponse = new Response(null, { status: 200 });
+  return shouldUseWebSession(request)
+    ? withWebRefreshCookie(request, baseResponse, null)
+    : baseResponse;
+}
+
+export function checkClientCredentialsParam(clientId: string, clientSecret: string, scope: string): boolean {
+  if (scope !== 'api') {
+    return false;
+  }
+  if (!clientId.startsWith('user.')) {
+    return false;
+  }
+  if (!clientSecret) {
+    return false;
+  }
+  return true;
 }
